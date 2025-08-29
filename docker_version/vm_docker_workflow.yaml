@@ -1,0 +1,202 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: ["staging"]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  APP_VERSION: '1.21'
+  DOCKER_COMPOSE_VERSION: '2.21.0'
+  HOST: ${{ secrets.VM_HOST }}
+  USER: ${{ secrets.VM_USER }}
+  DB_CONN_URL: ${{ secrets.DB_CONN_URL }}
+  GO_ENV: ${{ secrets.GO_ENV }}
+  GO_PORT: ${{ secrets.GO_PORT }}
+  # API Keys - Add your own API keys as GitHub secrets
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+  JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+  COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+  PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+  # Authentication
+  X_API_KEY: ${{ secrets.X_API_KEY }}
+
+  API_URL: ${{ secrets.API_URL }}
+  # Database Configuration
+  DB_NAME: ${{ secrets.DB_NAME }}
+ 
+  # Project Configuration
+  PROJECT_DIR: 'your-project-name'
+
+jobs:
+  tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run unit tests
+        run: |
+          echo "DB_CONN_URL=${{ env.DB_CONN_URL }}" >> .env
+          go clean -testcache
+          go test -v -race ./... -coverprofile=coverage.out
+          trap 'rm -f .env' EXIT  # Clean up .env file after tests
+          find . -type d -name "logs" -exec rm -rf {} +
+
+      # Uncomment to enable coverage reporting
+      # - name: Upload coverage reports
+      #   uses: codecov/codecov-action@v3
+      #   with:
+      #     files: ./coverage.out
+      #     fail_ci_if_error: true
+
+  deploy:
+    name: Deploy to VM
+    runs-on: ubuntu-latest
+    needs: tests  # Require tests to pass before deployment
+    environment: your-environment  # Add environment protection
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate deployment version
+        id: version
+        run: |
+          echo "DEPLOY_VERSION=$(date +'%Y%m%d_%H%M%S')-${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          echo "DEPLOY_TIME=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Install SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      - name: Add known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to VM VM
+        run: |
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'EOF'
+            set -e  # Exit on any error
+            
+            echo "🚀 Starting deployment version: ${{ steps.version.outputs.DEPLOY_VERSION }}"
+            
+            # Check if project directory exists
+            if [ ! -d "${{ env.PROJECT_DIR }}" ]; then
+              echo "❌ Project directory not found!"
+              exit 1
+            fi
+            
+            # Navigate to project directory
+            cd ${{ env.PROJECT_DIR }}
+            
+            # Backup current state
+            echo "📦 Creating backup..."
+            git stash || true
+            
+            # Update code
+            echo "⬇️ Pulling latest changes..."
+            git pull
+
+            # Clean up Docker environment
+            echo "🧹 Cleaning up Docker environment..."
+            sudo docker system prune -f
+            
+            # Build Docker images
+            echo "🔨 Building Docker images..."
+            . scripts/build.staging.sh
+
+            # Check for active swarm and handle appropriately
+            echo "🔍 Checking Docker Swarm status..."
+            if sudo docker info 2>/dev/null | grep -q "Is Manager: true"; then
+              echo "✅ Node is already a swarm manager"
+            elif sudo docker info 2>/dev/null | grep -q "Swarm: active"; then
+              echo "ℹ️ Node is a worker, attempting to join manager..."
+              # Try to get manager token and join
+              if [ -f "/root/swarm-token" ]; then
+                MANAGER_TOKEN=$(cat /root/swarm-token)
+                sudo docker swarm join --token ${{ secrets.MANAGER_TOKEN }} ${{ secrets.SWARM_MANAGER_IP }}:2377 || {
+                  echo "Failed to join existing swarm, initializing new one..."
+                  sudo docker swarm init
+                }
+              else
+                echo "No existing token found, initializing new swarm..."
+                sudo docker swarm init
+                sudo docker swarm join-token manager -q > /root/swarm-token
+              fi
+            else
+              echo "🔄 Initializing new Docker Swarm..."
+              sudo docker swarm init
+              # Save the manager token for future nodes
+              sudo docker swarm join-token manager -q > /root/swarm-token
+            fi
+
+            # Build and deploy
+            echo "🏗️ Building containers..."
+            sudo docker compose down --remove-orphans
+            
+            echo "🚀 Starting services..."
+            sudo env IMAGE_TAG=$(date +'%Y%m%d_%H') docker compose up -d
+            
+            # Health check
+            echo "🏥 Performing health check..."
+            for i in {1..12}; do
+              if curl -s https://your-domain.com/health; then
+                echo "✅ Service is healthy!"
+                break
+              fi
+              if [ $i -eq 12 ]; then
+                echo "❌ Service failed health check!"
+                sudo docker compose logs --tail=100
+                sudo docker compose down
+                exit 1
+              fi
+              echo "⏳ Waiting for service to be healthy... (attempt $i/12)"
+              sleep 12
+            done
+            
+            # Cleanup
+            echo "🧹 Cleaning up..."
+            sudo docker system prune -f
+            
+            echo "✅ Deployment completed successfully!"
+          EOF
+
+  rollback:
+    name: Rollback on Failure
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Install SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      - name: Add known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rollback deployment
+        run: |
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'EOF'
+            cd ${{ env.PROJECT_DIR }}
+            git reset --hard HEAD@{1}
+            sudo docker compose down
+            sudo env IMAGE_TAG=$(date +'%Y%m%d_%H') docker compose up -d
+            echo "🔄 Rollback completed"
+          EOF
